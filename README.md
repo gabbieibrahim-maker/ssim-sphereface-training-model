@@ -1,1 +1,0 @@
-# ssim-sphereface-training-model
