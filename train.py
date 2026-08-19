@@ -67,7 +67,7 @@ wandb.init(
     mode = wandbMode,
     entity = 'gabbieibrahim07-carnegie-mellon-university',
     project = 'sphereface training and validation testing',
-    name = 'whole dataset training - 8.19.26 implimenting ssimDiscretizer', # if we use same name, it will overwrite stuff with this name
+    name = 'whole dataset training - 8.19.26; ssimDiscretizer; changing how weights are saved after each epoch; overfitting', # if we use same name, it will overwrite stuff with this name
     config = dictionaryOfHyperparameters,
     save_code = True
 )
@@ -139,7 +139,7 @@ class AngleLoss(nn.Module): # sphereface / A-softmax (angular)
         super(AngleLoss, self).__init__()
         self.gamma = gamma
         self.it = 0
-        self.LambdaMin = 5.0
+        self.LambdaMin = 20.0 # increased this from 5 to 20 because self.lamb becomes very harsh very quickley (within epoch 1)
         self.LambdaMax = 1500.0
         self.lamb = 1500.0 # will decrease the more you train; lambda in annealing optimization strategy for A-softmax loss (in article)
 
@@ -361,8 +361,6 @@ def train(epoch):
     else:
       display = totalSamples // 10
 
-    # print(f'length of train set is {len(train_set)}') --> 881
-
     for index, info in enumerate(train_set, start = 1):
         condition, target, prompt, target_type, anatomy, artifact, ssimCalc, validSSIM = info
 
@@ -434,7 +432,6 @@ def train(epoch):
 
     avg_train_loss = loss_sum / totalNumOfImagesSeen
     avg_distance_train = distance_sum / totalNumOfImagesSeen
-    torch.save(network.state_dict(), "./model.pt") # saves the weights of the model after every batch (but we can change this to save after every epoch if we want)
 
     # checking class distribution
     # if epoch == 1:
@@ -711,10 +708,15 @@ ssimQuantileDiscretizerEdges = fittedSSIMQuantileDiscretizer.bin_edges_[0]
 ssimQDInteriorEdges = ssimQuantileDiscretizerEdges[1:-1] # cuts off first and last edges so we have n_bins buckets (indices 0 to numOfClasses-1)
 ssimEdgesTensor = torch.from_numpy(ssimQDInteriorEdges).float()
 
+
+# iteration loop
+
 all_val_sets = dict()
+best_val_loss = float('inf')
 
 for epoch in range(1, numOfEpochs + 1): # each epoch will be trained and tested
     totalValLossPerEpoch = 0
+    totalValAccPerEpoch = 0
 
     for anatomy in anatomies:
         print(f"\n--- Epoch {epoch}, loading data for anatomy: {anatomy} ---")
@@ -739,24 +741,39 @@ for epoch in range(1, numOfEpochs + 1): # each epoch will be trained and tested
         print(f'train batches: {len(train_set)}, val batches: {len(val_set)}')
 
         all_val_sets[anatomy] = val_set # only records the last validation set for each anatomy; others get overwritten
-
+        
         avg_train_loss, avg_distance_train = train(epoch)
         avg_val_loss, avg_val_accuracy, avg_distance_test = test(epoch)
+        
         totalValLossPerEpoch += avg_val_loss
+        totalValAccPerEpoch += avg_val_accuracy
 
         wandb.log({
-            "checkpoint": 'OVERALL EPOCH',
             "epoch": epoch,
-            "anatomy": anatomy,
-            "training loss": avg_train_loss,
-            "class error when training": avg_distance_train,
-            "validation loss": avg_val_loss,
-            "validation accuracy": avg_val_accuracy,
-            "class error when testing": avg_distance_test
+            f"{anatomy}/train_loss": avg_train_loss,
+            f"{anatomy}/train_class_error": avg_distance_train,
+            f"{anatomy}/val_loss": avg_val_loss,
+            f"{anatomy}/val_accuracy": avg_val_accuracy,
+            f"{anatomy}/val_class_error": avg_distance_test,
         })
+
     elapsedTime = (time.time() - script_start_time)
     print(f"Epoch {epoch}/{numOfEpochs} complete, elapsed seconds: {elapsedTime:.5f}, elapsed mins: {(elapsedTime/60):.5f} min")
+
     avgEpochValLoss = totalValLossPerEpoch / len(anatomies)
+    avgEpochValAcc = totalValAccPerEpoch / len(anatomies)
+
+    wandb.log({
+        "epoch": epoch,
+        "overall/val_loss": avgEpochValLoss,
+        "overall/val_accuracy": avgEpochValAcc,
+    })
+
+    # right now, model is saving weights even when validation loss gets worse
+    if avgEpochValLoss < best_val_loss: 
+        best_val_loss = avgEpochValLoss
+        torch.save(network.state_dict(), "./best_model.pt")
+
     prev_lr = optimizer.param_groups[0]['lr']
     scheduler.step(avgEpochValLoss) # allows scheduler to evaluate based on val loss this epoch
     new_lr = optimizer.param_groups[0]['lr']
