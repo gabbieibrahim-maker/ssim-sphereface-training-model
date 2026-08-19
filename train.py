@@ -12,10 +12,13 @@ learning_rate = 0.0001 #3e-4 recommended -> update: val loss was increasing very
 optimizerWillUse = ['SGD', 'Adam']
 optimizerIndex = optimizerWillUse[1]
 multiplier = 0.01 # penalty multiplier for changing lambda in loss function; default 0.1, experimented with 0.5, but model gets worse on epoch 3, meaning angular margin penalty is getting too harsh
-angularMargin = 5 # default 4; for AngleLinear
+angularMargin = 4 # default 4; for AngleLinear
 loRARank = 16 # common values 16, 32, 64
 smallSampleSize = None # keep None for regular
 numOfWorkers = 3 # more workers makes model run faster
+data_root = "/vast/tibrahim/jil202/data"
+anatomies = [ "knee", "brain", "prostate"]
+saveToWandB = True
 
 import torch
 import torch.nn as nn
@@ -23,11 +26,14 @@ import torch.nn.functional as F
 from transformers import AutoModel
 # from hugging face; AutoModel handles ViTs (dino) and Resnets differently
 
+from sklearn.preprocessing import KBinsDiscretizer # used to equally distribute classes across the training set to avoid biases
+
 from datasetgabbie import getloader_3d_patches
 import torch.optim as optim
 import os
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/scratch/slurm-{os.environ.get('SLURM_JOB_ID', 'local')}/torch_cache_{os.getpid()}"
 import wandb # used to log the metrics of our model
+import numpy as np
 
 from torch.nn import Parameter
 import math
@@ -35,6 +41,11 @@ from peft import LoftQConfig, LoraConfig, get_peft_model
 
 import time
 script_start_time = time.time()
+
+if saveToWandB:
+    wandbMode = 'online'
+else:
+    wandbMode = 'disabled'
 
 dictionaryOfHyperparameters = {
     "encoder" : encoderName,
@@ -53,9 +64,10 @@ dictionaryOfHyperparameters = {
 
 # to track on Weights & Biases
 wandb.init(
+    mode = wandbMode,
     entity = 'gabbieibrahim07-carnegie-mellon-university',
     project = 'sphereface training and validation testing',
-    name = 'whole dataset training - 8.17.26 changing gamma to 2; balance_by anatomy', # if we use same name, it will overwrite stuff with this name
+    name = 'whole dataset training - 8.19.26 implimenting ssimDiscretizer', # if we use same name, it will overwrite stuff with this name
     config = dictionaryOfHyperparameters,
     save_code = True
 )
@@ -174,7 +186,6 @@ class AngleLoss(nn.Module): # sphereface / A-softmax (angular)
         loss = loss.mean()
 
         return loss
-
 
 class EncoderAngularRegressor(nn.Module):
     # all encoder names (["dinov2", "dinov3", "resnet34", "resnet50"]) use this format
@@ -307,12 +318,6 @@ class EncoderAngularRegressor(nn.Module):
         return output
 
 
-'''
-
-using MNIST training and testing template (from google colab)
-
-'''
-
 network = EncoderAngularRegressor(difference_in_ssim, encoderName) # using a step size of 0.05 to divide up the ssim scores into classes
 network = torch.compile(network) # torch.compile will fuse a lot of the operations in the neural network and becomes more optimized
 network = network.cuda()
@@ -334,12 +339,14 @@ scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                                         )      
 loss_function = AngleLoss()
 
-
-data_root = "/vast/tibrahim/jil202/data"
-anatomies = [ "knee", "brain", "prostate"]
-
 classDistributionDictionary = dict()
 # balance_by is dictated by "anatomy" right now; checking if class distribution is even
+
+'''
+
+using MNIST training and testing template (from google colab)
+
+'''
 
 def train(epoch):
 
@@ -575,14 +582,10 @@ def test(epoch):
 
 
 def findTargetIndices(target): # target is the tensor of the float SSIM values for the whole batch
-    stepCt = network.diffInSSIM
-    numOfClasses = network.numOfClasses
-    classNum = torch.ceil(target/stepCt) - 1 # index 0 is [0, 0.05), index 1 is [0.05, 0.1), etc
-    # classNum is a tensor with size of the batch size minus the number of invalid SSIMs. size is <= batch size. instead of values being SSIMs, they are now classes
-    classNumClamped = torch.clamp(classNum, min = 0, max = numOfClasses - 1)
-    return classNumClamped.to(torch.int64)
-
-
+    ssimEdgesOnGPU = ssimEdgesTensor.to(target.device)
+    classBuckets = torch.bucketize(target, ssimEdgesOnGPU) # array of integer indices for which bin/bucket value belongs to
+    classBucketsClamped = torch.clamp(classBuckets, min = 0, max = network.numOfClasses - 1)
+    return classBucketsClamped.to(torch.int64)
 
 def getRGB(inputImgCuda):
 
@@ -656,6 +659,57 @@ def getPredictionOutput(info, conditionSingleSlice):
     predictionOutput = network(x) # "data" -> [B, 3, 224, 224]
     # predictionOutput is (cos_theta,phi_theta) from AngleLoss
     return predictionOutput
+
+
+
+# KBinsDiscretizer from scikit-learn
+# using this to impliment equal class distribution across the training set, as the raw training set has bias towards high classes (SSIM scores closer to 1)
+                                         
+def collectAllSSIMValues(numOfBatches, data_root, anatomies, numOfWorkers):
+    allVals = list()
+    for anatomy in anatomies:
+        train_set, _ = getloader_3d_patches(
+                        batch_size = numOfBatches, # common values: 32, 64
+                        data_root = data_root,
+                        contrast = anatomy,
+                        sample = 1.0,
+                        num_workers = numOfWorkers,
+                        distributed = False,
+                        rank = 0,
+                        world_size = 1,
+                        train_shuffle = None, # if samples per contrast is not None, decide if you want the same samples or random samples each epoch
+                        samples_per_contrast = None, # want to look at distribution of entire training set, even if we plan on running the script with a smaller sample size
+                        balance_by = "anatomy", # anatomy balance_by has many more samples than "anatomy_artifacts"
+                        patch_shape=(96, 96, 16),
+                        augment=None,
+                        augment_kwargs=None,
+                        artifacts=None,
+                    )
+        for info in train_set:
+            _, _, _, _, _, _, ssimCalc, validSSIM = info
+            floatSSIM = getValidFloatSSIM(ssimCalc, validSSIM) # currently a tensor
+            floatSSIMList = floatSSIM.tolist()
+            allVals.extend(floatSSIMList)
+    return allVals
+
+ssimQuantileDiscretizer = KBinsDiscretizer(n_bins = network.numOfClasses, # in other words, number of classes
+                                            encode='ordinal',
+                                            strategy='quantile', # quantile - all bins in each feature have same number of points; returns cut offs (num of classes - 1) 
+                                            dtype=None, 
+                                            subsample=None, # None - all training samples are used when computing quantiles that determine the binning thresholds 
+                                            random_state=None)
+
+allSSIMValues = collectAllSSIMValues(numOfBatches, data_root, anatomies, numOfWorkers)
+
+# quantile discretizer expects a 2D array
+allSSIMValuesArray = np.array(allSSIMValues) # list to array
+allSSIMValuesReshaped = allSSIMValuesArray.reshape(-1, 1)
+
+fittedSSIMQuantileDiscretizer = ssimQuantileDiscretizer.fit(allSSIMValuesReshaped) # fits data into n_bins number of bins
+
+ssimQuantileDiscretizerEdges = fittedSSIMQuantileDiscretizer.bin_edges_[0]
+ssimQDInteriorEdges = ssimQuantileDiscretizerEdges[1:-1] # cuts off first and last edges so we have n_bins buckets (indices 0 to numOfClasses-1)
+ssimEdgesTensor = torch.from_numpy(ssimQDInteriorEdges).float()
 
 all_val_sets = dict()
 
